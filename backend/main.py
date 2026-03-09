@@ -7,6 +7,7 @@ from typing import Optional
 import uuid
 import os
 import shutil
+import tempfile
 from datetime import datetime
 from dotenv import load_dotenv
 load_dotenv()
@@ -453,3 +454,239 @@ def get_graph(repo_id: str, db: Session = Depends(get_db)):
             })
 
     return result
+# ─── NODE DETAIL + PATH ENDPOINTS ────────────────────────────────────────────
+
+@app.get("/nodes/{node_id}")
+def get_node(node_id: str, db: Session = Depends(get_db)):
+    node = db.query(GraphNode).filter(GraphNode.id == node_id, GraphNode.is_deleted == False).first()
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    source = db.query(Source).filter(Source.id == node.source_id).first() if node.source_id else None
+    owner_label = None
+    if node.owner_id:
+        owner_node = db.query(GraphNode).filter(GraphNode.id == node.owner_id).first()
+        owner_label = owner_node.label if owner_node else None
+
+    return {
+        "id": node.id,
+        "label": node.label,
+        "node_type": node.node_type,
+        "sub_type": node.sub_type,
+        "content": node.content,
+        "owner_type": node.owner_type,
+        "owner_label": owner_label,
+        "source_id": node.source_id,
+        "artifact_label": source.filename if source else None,
+        "repo_id": node.repo_id,
+    }
+
+
+@app.get("/nodes/{node_id}/path")
+def get_node_path(node_id: str, db: Session = Depends(get_db)):
+    node = db.query(GraphNode).filter(GraphNode.id == node_id, GraphNode.is_deleted == False).first()
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    path = []
+    current = node
+
+    while current:
+        source = db.query(Source).filter(Source.id == current.source_id).first() if current.source_id else None
+        owner_node = db.query(GraphNode).filter(GraphNode.id == current.owner_id).first() if current.owner_id else None
+        path.insert(0, {
+            "id": current.id,
+            "label": current.label,
+            "node_type": current.node_type,
+            "sub_type": current.sub_type,
+            "owner_label": owner_node.label if owner_node else None,
+            "artifact_label": source.filename if source else None,
+        })
+        # Find parent via edge
+        edge = db.query(GraphEdge).filter(
+            GraphEdge.to_node_id == current.id,
+            GraphEdge.is_deleted == False
+        ).first()
+        if edge:
+            current = db.query(GraphNode).filter(GraphNode.id == edge.from_node_id).first()
+        else:
+            break
+
+    return {"focused_node_id": node_id, "path": path}
+
+
+@app.get("/repos/{repo_id}/graph/nodes")
+def get_all_graph_nodes(repo_id: str, db: Session = Depends(get_db)):
+    nodes = db.query(GraphNode).filter(
+        GraphNode.repo_id == repo_id,
+        GraphNode.is_deleted == False
+    ).all()
+
+    edges = db.query(GraphEdge).filter(
+        GraphEdge.repo_id == repo_id,
+        GraphEdge.is_deleted == False
+    ).all()
+
+    nodes_out = []
+    for n in nodes:
+        source = db.query(Source).filter(Source.id == n.source_id).first() if n.source_id else None
+        owner_node = db.query(GraphNode).filter(GraphNode.id == n.owner_id).first() if n.owner_id else None
+        nodes_out.append({
+            "id": n.id,
+            "label": n.label,
+            "node_type": n.node_type,
+            "sub_type": n.sub_type,
+            "content": n.content,
+            "owner_type": n.owner_type,
+            "owner_id": n.owner_id,
+            "owner_label": owner_node.label if owner_node else None,
+            "source_id": n.source_id,
+            "artifact_label": source.filename if source else None,
+        })
+
+    edges_out = [{"from": e.from_node_id, "to": e.to_node_id, "relation": e.relation_type} for e in edges]
+
+    return {"nodes": nodes_out, "edges": edges_out}
+# ─── AUTO-DETECT ARTIFACT TYPE ───────────────────────────────────────────────
+
+@app.post("/repos/{repo_id}/sources/detect-type")
+async def detect_artifact_type(
+    repo_id: str,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
+    import tempfile
+    from ingest import extract_text_from_docx, extract_text_from_pptx
+    import google.generativeai as genai
+
+    # Save file temporarily
+    ext = os.path.splitext(file.filename)[1].lower()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+        shutil.copyfileobj(file.file, tmp)
+        tmp_path = tmp.name
+
+    try:
+        # Extract first 200 words
+        text = ""
+        if ext == ".docx":
+            from ingest import extract_text_from_docx
+            text = extract_text_from_docx(tmp_path)
+        elif ext == ".pptx":
+            from ingest import extract_text_from_pptx
+            text = extract_text_from_pptx(tmp_path)
+        elif ext == ".pdf":
+            text = f"PDF file: {file.filename}"
+        elif ext in (".png", ".jpg", ".jpeg"):
+            text = f"Image file: {file.filename}"
+
+        words = " ".join(text.split()[:200])
+
+        prompt = f"""You are a document classifier. Based on the filename and first 200 words, classify this document into exactly one of these artifact types:
+SOW, Proposal, DesignDocument, ProcessMap, DiscoveryNotes, Other
+
+Filename: {file.filename}
+First 200 words: {words}
+
+Reply with ONLY the artifact type, nothing else. Must be one of: SOW, Proposal, DesignDocument, ProcessMap, DiscoveryNotes, Other"""
+
+        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+        model = genai.GenerativeModel("gemini-1.5-flash")
+        response = model.generate_content(prompt)
+        detected = response.text.strip()
+
+        valid_types = ["SOW", "Proposal", "DesignDocument", "ProcessMap", "DiscoveryNotes", "Other"]
+        if detected not in valid_types:
+            detected = "Other"
+
+    except Exception as e:
+        detected = "Other"
+    finally:
+        os.unlink(tmp_path)
+
+    return {"artifact_type": detected, "filename": file.filename}
+# ─── BULK UPLOAD ─────────────────────────────────────────────────────────────
+
+@app.post("/repos/{repo_id}/sources/bulk", status_code=201)
+async def bulk_upload_sources(
+    repo_id: str,
+    files: list[UploadFile] = File(...),
+    is_internal: str = Form(...),
+    account_id: Optional[str] = Form(None),
+    db: Session = Depends(get_db)
+):
+    repo = db.query(Repo).filter(Repo.id == repo_id).first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    is_internal_bool = is_internal.lower() == "true"
+
+    if not is_internal_bool and not account_id:
+        raise HTTPException(status_code=422, detail="Account is required when not internal")
+
+    ALLOWED_EXTENSIONS = {".docx", ".pdf", ".png", ".pptx", ".jpg", ".jpeg"}
+    uploaded = []
+
+    for file in files:
+        ext = os.path.splitext(file.filename)[1].lower()
+        if ext not in ALLOWED_EXTENSIONS:
+            continue
+
+        # Auto-detect artifact type
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
+            shutil.copyfileobj(file.file, tmp)
+            tmp_path = tmp.name
+
+        try:
+            text = ""
+            if ext == ".docx":
+                from ingest import extract_text_from_docx
+                text = extract_text_from_docx(tmp_path)
+            elif ext == ".pptx":
+                from ingest import extract_text_from_pptx
+                text = extract_text_from_pptx(tmp_path)
+
+            words = " ".join(text.split()[:200])
+
+            prompt = f"""Classify this document into exactly one of: SOW, Proposal, DesignDocument, ProcessMap, DiscoveryNotes, Other
+Filename: {file.filename}
+First 200 words: {words}
+Reply with ONLY the artifact type."""
+
+            from google import genai as google_genai
+            _client = google_genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+            response = _client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
+            artifact_type = response.text.strip()
+            valid_types = ["SOW", "Proposal", "DesignDocument", "ProcessMap", "DiscoveryNotes", "Other"]
+            if artifact_type not in valid_types:
+                artifact_type = "Other"
+        except:
+            artifact_type = "Other"
+
+        # Move tmp to uploads
+        file_id = str(uuid.uuid4())
+        stored_filename = f"{file_id}{ext}"
+        stored_path = os.path.join(UPLOAD_DIR, stored_filename)
+        shutil.move(tmp_path, stored_path)
+        file_size = os.path.getsize(stored_path)
+
+        source = Source(
+            id=str(uuid.uuid4()),
+            repo_id=repo_id,
+            account_id=account_id if not is_internal_bool else None,
+            filename=file.filename,
+            stored_path=stored_path,
+            artifact_type=artifact_type,
+            is_internal=is_internal_bool,
+            size_bytes=file_size,
+            mime_type=file.content_type,
+        )
+        db.add(source)
+        db.commit()
+        db.refresh(source)
+        uploaded.append({
+            "filename": source.filename,
+            "artifact_type": source.artifact_type,
+            "id": source.id
+        })
+
+    return {"uploaded": uploaded, "count": len(uploaded)}
