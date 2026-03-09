@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, UploadFile, File, Form, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
@@ -8,9 +8,12 @@ import uuid
 import os
 import shutil
 from datetime import datetime
+from dotenv import load_dotenv
+load_dotenv()
 
 from database import engine, get_db, Base
-from models import Repo, Account, Source
+from models import Repo, Account, Source, GraphNode, GraphEdge
+from ingest import ingest_source, ARTIFACT_SUB_TYPES
 
 Base.metadata.create_all(bind=engine)
 
@@ -153,7 +156,6 @@ def delete_repo(repo_id: str, db: Session = Depends(get_db)):
     db_repo = db.query(Repo).filter(Repo.id == repo_id).first()
     if not db_repo:
         raise HTTPException(status_code=404, detail="Repo not found")
-    # Delete uploaded files
     for source in db_repo.sources:
         if os.path.exists(source.stored_path):
             os.remove(source.stored_path)
@@ -246,7 +248,6 @@ async def upload_source(
     if not is_internal_bool and not account_id:
         raise HTTPException(status_code=422, detail="Account is required when not internal")
 
-    # Save file
     file_id = str(uuid.uuid4())
     ext = os.path.splitext(file.filename)[1]
     stored_filename = f"{file_id}{ext}"
@@ -294,3 +295,161 @@ def delete_source(source_id: str, db: Session = Depends(get_db)):
         os.remove(source.stored_path)
     db.delete(source)
     db.commit()
+
+# ─── GRAPH BUILD STATUS (in-memory per repo) ─────────────────────────────────
+graph_build_status = {}
+
+# ─── BACKGROUND GRAPH BUILD FUNCTION ─────────────────────────────────────────
+def run_graph_build(repo_id: str, sources):
+    from database import SessionLocal
+    db = SessionLocal()
+    try:
+        # Soft delete existing nodes and edges
+        db.query(GraphEdge).filter(GraphEdge.repo_id == repo_id).update({"is_deleted": True})
+        db.query(GraphNode).filter(GraphNode.repo_id == repo_id).update({"is_deleted": True})
+        db.commit()
+
+        # Create Repo node
+        repo = db.query(Repo).filter(Repo.id == repo_id).first()
+        repo_node = GraphNode(
+            repo_id=repo_id, node_type="Repo", label=repo.name, is_deleted=False
+        )
+        db.add(repo_node)
+        db.flush()
+
+        account_nodes = {}
+        type_nodes = {}
+
+        for i, source in enumerate(sources):
+            graph_build_status[repo_id]["message"] = f"Processing {source.filename}..."
+
+            # Owner node (Account or Internal)
+            if source.is_internal:
+                owner_key = "internal"
+                if owner_key not in account_nodes:
+                    node = GraphNode(repo_id=repo_id, node_type="Internal", label="Internal", is_deleted=False)
+                    db.add(node)
+                    db.flush()
+                    account_nodes[owner_key] = node
+                    db.add(GraphEdge(repo_id=repo_id, from_node_id=repo_node.id, to_node_id=node.id, relation_type="HAS_INTERNAL", is_deleted=False))
+                owner_node = account_nodes[owner_key]
+                owner_type = "Internal"
+                owner_id = owner_node.id
+            else:
+                owner_key = source.account_id
+                if owner_key not in account_nodes:
+                    account = db.query(Account).filter(Account.id == source.account_id).first()
+                    node = GraphNode(repo_id=repo_id, node_type="Account", label=account.name, is_deleted=False)
+                    db.add(node)
+                    db.flush()
+                    account_nodes[owner_key] = node
+                    db.add(GraphEdge(repo_id=repo_id, from_node_id=repo_node.id, to_node_id=node.id, relation_type="HAS_ACCOUNT", is_deleted=False))
+                owner_node = account_nodes[owner_key]
+                owner_type = "Account"
+                owner_id = owner_node.id
+
+            # ArtifactType node
+            atype = source.artifact_type
+            if atype not in type_nodes:
+                node = GraphNode(repo_id=repo_id, node_type="ArtifactType", label=atype, is_deleted=False)
+                db.add(node)
+                db.flush()
+                type_nodes[atype] = node
+                db.add(GraphEdge(repo_id=repo_id, from_node_id=repo_node.id, to_node_id=node.id, relation_type="HAS_TYPE", is_deleted=False))
+            type_node = type_nodes[atype]
+
+            # Artifact node
+            artifact_node = GraphNode(
+                repo_id=repo_id, source_id=source.id, node_type="Artifact",
+                sub_type=ARTIFACT_SUB_TYPES.get(atype, "Other_Document"),
+                label=source.filename, owner_type=owner_type, owner_id=owner_id, is_deleted=False
+            )
+            db.add(artifact_node)
+            db.flush()
+            db.add(GraphEdge(repo_id=repo_id, from_node_id=owner_node.id, to_node_id=artifact_node.id, relation_type="HAS_ARTIFACT", is_deleted=False))
+            db.add(GraphEdge(repo_id=repo_id, from_node_id=type_node.id, to_node_id=artifact_node.id, relation_type="HAS_ARTIFACT", is_deleted=False))
+
+            # Extract sections via LLM
+            sections = ingest_source(source, db)
+            for sub_type, label, content in sections:
+                section_node = GraphNode(
+                    repo_id=repo_id, source_id=source.id, node_type="Section",
+                    sub_type=sub_type, label=label, content=content,
+                    owner_type=owner_type, owner_id=owner_id, is_deleted=False
+                )
+                db.add(section_node)
+                db.flush()
+                db.add(GraphEdge(repo_id=repo_id, from_node_id=artifact_node.id, to_node_id=section_node.id, relation_type="HAS_SECTION", is_deleted=False))
+
+            db.commit()
+            graph_build_status[repo_id]["artifacts_done"] = i + 1
+
+        graph_build_status[repo_id]["status"] = "done"
+        graph_build_status[repo_id]["message"] = "Graph build complete!"
+
+    except Exception as e:
+        db.rollback()
+        graph_build_status[repo_id]["status"] = "error"
+        graph_build_status[repo_id]["message"] = str(e)
+    finally:
+        db.close()
+
+# ─── GRAPH ENDPOINTS ──────────────────────────────────────────────────────────
+@app.post("/repos/{repo_id}/build-graph")
+def build_graph(repo_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    repo = db.query(Repo).filter(Repo.id == repo_id).first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    sources = db.query(Source).filter(Source.repo_id == repo_id).all()
+    if not sources:
+        raise HTTPException(status_code=400, detail="No sources found in this repo")
+
+    graph_build_status[repo_id] = {
+        "status": "running",
+        "message": "Starting graph build...",
+        "artifacts_done": 0,
+        "artifacts_total": len(sources)
+    }
+
+    background_tasks.add_task(run_graph_build, repo_id, sources)
+    return {"message": "Graph build started", "total_sources": len(sources)}
+
+
+@app.get("/repos/{repo_id}/build-graph/status")
+def get_build_status(repo_id: str):
+    status = graph_build_status.get(repo_id)
+    if not status:
+        return {"status": "not_started"}
+    return status
+
+
+@app.get("/repos/{repo_id}/graph")
+def get_graph(repo_id: str, db: Session = Depends(get_db)):
+    nodes = db.query(GraphNode).filter(
+        GraphNode.repo_id == repo_id,
+        GraphNode.is_deleted == False
+    ).all()
+
+    result = []
+    for source in db.query(Source).filter(Source.repo_id == repo_id).all():
+        artifact_nodes = [n for n in nodes if n.source_id == source.id and n.node_type == "Artifact"]
+        section_nodes = [n for n in nodes if n.source_id == source.id and n.node_type == "Section"]
+
+        if artifact_nodes:
+            if source.account_id:
+                account = db.query(Account).filter(Account.id == source.account_id).first()
+                owned_by = account.name if account else "Unknown"
+            else:
+                owned_by = "Internal"
+
+            result.append({
+                "source_id": source.id,
+                "artifact_name": source.filename,
+                "artifact_type": source.artifact_type,
+                "owned_by": owned_by,
+                "section_count": len(section_nodes),
+                "sections": [{"sub_type": s.sub_type, "label": s.label, "content": s.content} for s in section_nodes]
+            })
+
+    return result
