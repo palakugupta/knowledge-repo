@@ -1,14 +1,9 @@
 import os
 import json
-import google.generativeai as genai
+from groq import Groq
 from docx import Document as DocxDocument
 from pptx import Presentation
-import base64
 
-genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-model = genai.GenerativeModel("gemini-1.5-flash")
-
-# Static section templates per artifact type
 SECTION_TEMPLATES = {
     "SOW": [
         ("SOW_ProjectOverview", "Project Overview"),
@@ -106,7 +101,7 @@ You will be given a document of type: {artifact_type}.
 Extract content for each of these sections: {', '.join(section_names)}.
 Return a JSON object where keys are the section names and values are the extracted content (2-5 sentences max per section).
 If a section is not present in the document, return an empty string for that section.
-Return ONLY valid JSON, no other text, no markdown fences.
+Return ONLY valid JSON, no markdown fences, no extra text.
 
 Document: {filename}
 
@@ -114,24 +109,23 @@ Content:
 {text[:6000]}"""
 
     try:
-        if is_image and image_path:
-            import PIL.Image
-            img = PIL.Image.open(image_path)
-            response = model.generate_content([prompt, img])
-        else:
-            response = model.generate_content(prompt)
-
-        raw = response.text.strip()
-        # Clean markdown fences if present
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.2,
+        )
+        raw = response.choices[0].message.content.strip()
         if raw.startswith("```"):
-            raw = raw.split("```")[1]
+            parts = raw.split("```")
+            raw = parts[1] if len(parts) > 1 else raw
             if raw.startswith("json"):
                 raw = raw[4:]
         raw = raw.strip()
-
         extracted = json.loads(raw)
+        print(f"✅ LLM extraction success for {filename}: {len(extracted)} sections")
     except Exception as e:
-        print(f"LLM extraction error for {filename}: {e}")
+        print(f"❌ LLM extraction error for {filename}: {e}")
         extracted = {}
 
     result = []
@@ -153,12 +147,16 @@ def ingest_source(source, db):
     ext = filename.lower().split(".")[-1]
     if ext == "docx":
         text = extract_text_from_docx(path)
+        print(f"📄 Extracted {len(text)} chars from {filename}")
     elif ext == "pptx":
         text = extract_text_from_pptx(path)
+        print(f"📊 Extracted {len(text)} chars from {filename}")
     elif ext in ("png", "jpg", "jpeg"):
         is_image = True
+        print(f"🖼️ Processing image: {filename}")
     else:
         text = ""
+        print(f"⚠️ Unknown file type: {filename}")
 
     sections = extract_sections_with_llm(
         text, artifact_type, filename,

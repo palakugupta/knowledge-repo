@@ -18,7 +18,6 @@ from ingest import ingest_source, ARTIFACT_SUB_TYPES
 
 Base.metadata.create_all(bind=engine)
 
-# Create uploads directory
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
@@ -33,7 +32,6 @@ app.add_middleware(
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
-# --- Schemas ---
 class RepoCreate(BaseModel):
     name: str
     description: Optional[str] = None
@@ -41,17 +39,6 @@ class RepoCreate(BaseModel):
 class RepoUpdate(BaseModel):
     name: str
     description: Optional[str] = None
-
-class RepoOut(BaseModel):
-    id: str
-    name: str
-    description: Optional[str]
-    source_count: int = 0
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
 
 class AccountCreate(BaseModel):
     name: str
@@ -63,31 +50,9 @@ class AccountUpdate(BaseModel):
     industry: Optional[str] = None
     notes: Optional[str] = None
 
-class AccountOut(BaseModel):
-    id: str
-    name: str
-    industry: Optional[str]
-    notes: Optional[str]
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
-
-class SourceOut(BaseModel):
-    id: str
-    repo_id: str
-    filename: str
-    artifact_type: str
-    is_internal: bool
-    account_id: Optional[str]
-    account_name: Optional[str] = None
-    size_bytes: Optional[int]
-    mime_type: Optional[str]
-    uploaded_at: datetime
-
-    class Config:
-        from_attributes = True
+class ChatMessage(BaseModel):
+    message: str
+    history: list = []
 
 # --- Repo Routes ---
 @app.get("/repos")
@@ -126,11 +91,7 @@ def create_repo(repo: RepoCreate, db: Session = Depends(get_db)):
     existing = db.query(Repo).filter(Repo.name == repo.name.strip()).first()
     if existing:
         raise HTTPException(status_code=409, detail="Repo name already exists")
-    new_repo = Repo(
-        id=str(uuid.uuid4()),
-        name=repo.name.strip(),
-        description=repo.description
-    )
+    new_repo = Repo(id=str(uuid.uuid4()), name=repo.name.strip(), description=repo.description)
     db.add(new_repo)
     db.commit()
     db.refresh(new_repo)
@@ -175,12 +136,7 @@ def create_account(account: AccountCreate, db: Session = Depends(get_db)):
     existing = db.query(Account).filter(Account.name == account.name.strip()).first()
     if existing:
         raise HTTPException(status_code=409, detail="Account name already exists")
-    new_account = Account(
-        id=str(uuid.uuid4()),
-        name=account.name.strip(),
-        industry=account.industry,
-        notes=account.notes
-    )
+    new_account = Account(id=str(uuid.uuid4()), name=account.name.strip(), industry=account.industry, notes=account.notes)
     db.add(new_account)
     db.commit()
     db.refresh(new_account)
@@ -243,48 +199,30 @@ async def upload_source(
     repo = db.query(Repo).filter(Repo.id == repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
-
     is_internal_bool = is_internal.lower() == "true"
-
     if not is_internal_bool and not account_id:
         raise HTTPException(status_code=422, detail="Account is required when not internal")
-
     file_id = str(uuid.uuid4())
     ext = os.path.splitext(file.filename)[1]
-    stored_filename = f"{file_id}{ext}"
-    stored_path = os.path.join(UPLOAD_DIR, stored_filename)
-
+    stored_path = os.path.join(UPLOAD_DIR, f"{file_id}{ext}")
     with open(stored_path, "wb") as buffer:
         shutil.copyfileobj(file.file, buffer)
-
-    file_size = os.path.getsize(stored_path)
-
     source = Source(
-        id=str(uuid.uuid4()),
-        repo_id=repo_id,
+        id=str(uuid.uuid4()), repo_id=repo_id,
         account_id=account_id if not is_internal_bool else None,
-        filename=file.filename,
-        stored_path=stored_path,
-        artifact_type=artifact_type,
-        is_internal=is_internal_bool,
-        size_bytes=file_size,
-        mime_type=file.content_type,
+        filename=file.filename, stored_path=stored_path,
+        artifact_type=artifact_type, is_internal=is_internal_bool,
+        size_bytes=os.path.getsize(stored_path), mime_type=file.content_type,
     )
     db.add(source)
     db.commit()
     db.refresh(source)
-
     return {
-        "id": source.id,
-        "repo_id": source.repo_id,
-        "filename": source.filename,
-        "artifact_type": source.artifact_type,
-        "is_internal": source.is_internal,
+        "id": source.id, "repo_id": source.repo_id, "filename": source.filename,
+        "artifact_type": source.artifact_type, "is_internal": source.is_internal,
         "account_id": source.account_id,
         "account_name": source.account.name if source.account else None,
-        "size_bytes": source.size_bytes,
-        "mime_type": source.mime_type,
-        "uploaded_at": source.uploaded_at,
+        "size_bytes": source.size_bytes, "mime_type": source.mime_type, "uploaded_at": source.uploaded_at,
     }
 
 @app.delete("/sources/{source_id}", status_code=204)
@@ -297,24 +235,19 @@ def delete_source(source_id: str, db: Session = Depends(get_db)):
     db.delete(source)
     db.commit()
 
-# ─── GRAPH BUILD STATUS (in-memory per repo) ─────────────────────────────────
+# ─── GRAPH BUILD ─────────────────────────────────────────────────────────────
 graph_build_status = {}
 
-# ─── BACKGROUND GRAPH BUILD FUNCTION ─────────────────────────────────────────
 def run_graph_build(repo_id: str, sources):
     from database import SessionLocal
     db = SessionLocal()
     try:
-        # Soft delete existing nodes and edges
         db.query(GraphEdge).filter(GraphEdge.repo_id == repo_id).update({"is_deleted": True})
         db.query(GraphNode).filter(GraphNode.repo_id == repo_id).update({"is_deleted": True})
         db.commit()
 
-        # Create Repo node
         repo = db.query(Repo).filter(Repo.id == repo_id).first()
-        repo_node = GraphNode(
-            repo_id=repo_id, node_type="Repo", label=repo.name, is_deleted=False
-        )
+        repo_node = GraphNode(repo_id=repo_id, node_type="Repo", label=repo.name, is_deleted=False)
         db.add(repo_node)
         db.flush()
 
@@ -324,7 +257,6 @@ def run_graph_build(repo_id: str, sources):
         for i, source in enumerate(sources):
             graph_build_status[repo_id]["message"] = f"Processing {source.filename}..."
 
-            # Owner node (Account or Internal)
             if source.is_internal:
                 owner_key = "internal"
                 if owner_key not in account_nodes:
@@ -349,7 +281,6 @@ def run_graph_build(repo_id: str, sources):
                 owner_type = "Account"
                 owner_id = owner_node.id
 
-            # ArtifactType node
             atype = source.artifact_type
             if atype not in type_nodes:
                 node = GraphNode(repo_id=repo_id, node_type="ArtifactType", label=atype, is_deleted=False)
@@ -359,7 +290,6 @@ def run_graph_build(repo_id: str, sources):
                 db.add(GraphEdge(repo_id=repo_id, from_node_id=repo_node.id, to_node_id=node.id, relation_type="HAS_TYPE", is_deleted=False))
             type_node = type_nodes[atype]
 
-            # Artifact node
             artifact_node = GraphNode(
                 repo_id=repo_id, source_id=source.id, node_type="Artifact",
                 sub_type=ARTIFACT_SUB_TYPES.get(atype, "Other_Document"),
@@ -370,7 +300,6 @@ def run_graph_build(repo_id: str, sources):
             db.add(GraphEdge(repo_id=repo_id, from_node_id=owner_node.id, to_node_id=artifact_node.id, relation_type="HAS_ARTIFACT", is_deleted=False))
             db.add(GraphEdge(repo_id=repo_id, from_node_id=type_node.id, to_node_id=artifact_node.id, relation_type="HAS_ARTIFACT", is_deleted=False))
 
-            # Extract sections via LLM
             sections = ingest_source(source, db)
             for sub_type, label, content in sections:
                 section_node = GraphNode(
@@ -395,184 +324,117 @@ def run_graph_build(repo_id: str, sources):
     finally:
         db.close()
 
-# ─── GRAPH ENDPOINTS ──────────────────────────────────────────────────────────
 @app.post("/repos/{repo_id}/build-graph")
 def build_graph(repo_id: str, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     repo = db.query(Repo).filter(Repo.id == repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
-
     sources = db.query(Source).filter(Source.repo_id == repo_id).all()
     if not sources:
         raise HTTPException(status_code=400, detail="No sources found in this repo")
-
-    graph_build_status[repo_id] = {
-        "status": "running",
-        "message": "Starting graph build...",
-        "artifacts_done": 0,
-        "artifacts_total": len(sources)
-    }
-
+    graph_build_status[repo_id] = {"status": "running", "message": "Starting graph build...", "artifacts_done": 0, "artifacts_total": len(sources)}
     background_tasks.add_task(run_graph_build, repo_id, sources)
     return {"message": "Graph build started", "total_sources": len(sources)}
 
-
 @app.get("/repos/{repo_id}/build-graph/status")
 def get_build_status(repo_id: str):
-    status = graph_build_status.get(repo_id)
-    if not status:
-        return {"status": "not_started"}
-    return status
-
+    return graph_build_status.get(repo_id, {"status": "not_started"})
 
 @app.get("/repos/{repo_id}/graph")
 def get_graph(repo_id: str, db: Session = Depends(get_db)):
-    nodes = db.query(GraphNode).filter(
-        GraphNode.repo_id == repo_id,
-        GraphNode.is_deleted == False
-    ).all()
-
+    nodes = db.query(GraphNode).filter(GraphNode.repo_id == repo_id, GraphNode.is_deleted == False).all()
     result = []
     for source in db.query(Source).filter(Source.repo_id == repo_id).all():
         artifact_nodes = [n for n in nodes if n.source_id == source.id and n.node_type == "Artifact"]
         section_nodes = [n for n in nodes if n.source_id == source.id and n.node_type == "Section"]
-
         if artifact_nodes:
             if source.account_id:
                 account = db.query(Account).filter(Account.id == source.account_id).first()
                 owned_by = account.name if account else "Unknown"
             else:
                 owned_by = "Internal"
-
             result.append({
-                "source_id": source.id,
-                "artifact_name": source.filename,
-                "artifact_type": source.artifact_type,
-                "owned_by": owned_by,
+                "source_id": source.id, "artifact_name": source.filename,
+                "artifact_type": source.artifact_type, "owned_by": owned_by,
                 "section_count": len(section_nodes),
                 "sections": [{"sub_type": s.sub_type, "label": s.label, "content": s.content} for s in section_nodes]
             })
-
     return result
-# ─── NODE DETAIL + PATH ENDPOINTS ────────────────────────────────────────────
 
+# ─── NODE DETAIL + PATH ENDPOINTS ────────────────────────────────────────────
 @app.get("/nodes/{node_id}")
 def get_node(node_id: str, db: Session = Depends(get_db)):
     node = db.query(GraphNode).filter(GraphNode.id == node_id, GraphNode.is_deleted == False).first()
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-
     source = db.query(Source).filter(Source.id == node.source_id).first() if node.source_id else None
-    owner_label = None
-    if node.owner_id:
-        owner_node = db.query(GraphNode).filter(GraphNode.id == node.owner_id).first()
-        owner_label = owner_node.label if owner_node else None
-
+    owner_node = db.query(GraphNode).filter(GraphNode.id == node.owner_id).first() if node.owner_id else None
     return {
-        "id": node.id,
-        "label": node.label,
-        "node_type": node.node_type,
-        "sub_type": node.sub_type,
-        "content": node.content,
-        "owner_type": node.owner_type,
-        "owner_label": owner_label,
+        "id": node.id, "label": node.label, "node_type": node.node_type,
+        "sub_type": node.sub_type, "content": node.content, "owner_type": node.owner_type,
+        "owner_label": owner_node.label if owner_node else None,
         "source_id": node.source_id,
         "artifact_label": source.filename if source else None,
         "repo_id": node.repo_id,
     }
-
 
 @app.get("/nodes/{node_id}/path")
 def get_node_path(node_id: str, db: Session = Depends(get_db)):
     node = db.query(GraphNode).filter(GraphNode.id == node_id, GraphNode.is_deleted == False).first()
     if not node:
         raise HTTPException(status_code=404, detail="Node not found")
-
     path = []
     current = node
-
     while current:
         source = db.query(Source).filter(Source.id == current.source_id).first() if current.source_id else None
         owner_node = db.query(GraphNode).filter(GraphNode.id == current.owner_id).first() if current.owner_id else None
         path.insert(0, {
-            "id": current.id,
-            "label": current.label,
-            "node_type": current.node_type,
+            "id": current.id, "label": current.label, "node_type": current.node_type,
             "sub_type": current.sub_type,
             "owner_label": owner_node.label if owner_node else None,
             "artifact_label": source.filename if source else None,
         })
-        # Find parent via edge
-        edge = db.query(GraphEdge).filter(
-            GraphEdge.to_node_id == current.id,
-            GraphEdge.is_deleted == False
-        ).first()
+        edge = db.query(GraphEdge).filter(GraphEdge.to_node_id == current.id, GraphEdge.is_deleted == False).first()
         if edge:
             current = db.query(GraphNode).filter(GraphNode.id == edge.from_node_id).first()
         else:
             break
-
     return {"focused_node_id": node_id, "path": path}
-
 
 @app.get("/repos/{repo_id}/graph/nodes")
 def get_all_graph_nodes(repo_id: str, db: Session = Depends(get_db)):
-    nodes = db.query(GraphNode).filter(
-        GraphNode.repo_id == repo_id,
-        GraphNode.is_deleted == False
-    ).all()
-
-    edges = db.query(GraphEdge).filter(
-        GraphEdge.repo_id == repo_id,
-        GraphEdge.is_deleted == False
-    ).all()
-
+    nodes = db.query(GraphNode).filter(GraphNode.repo_id == repo_id, GraphNode.is_deleted == False).all()
+    edges = db.query(GraphEdge).filter(GraphEdge.repo_id == repo_id, GraphEdge.is_deleted == False).all()
     nodes_out = []
     for n in nodes:
         source = db.query(Source).filter(Source.id == n.source_id).first() if n.source_id else None
         owner_node = db.query(GraphNode).filter(GraphNode.id == n.owner_id).first() if n.owner_id else None
         nodes_out.append({
-            "id": n.id,
-            "label": n.label,
-            "node_type": n.node_type,
-            "sub_type": n.sub_type,
-            "content": n.content,
-            "owner_type": n.owner_type,
-            "owner_id": n.owner_id,
+            "id": n.id, "label": n.label, "node_type": n.node_type, "sub_type": n.sub_type,
+            "content": n.content, "owner_type": n.owner_type, "owner_id": n.owner_id,
             "owner_label": owner_node.label if owner_node else None,
             "source_id": n.source_id,
             "artifact_label": source.filename if source else None,
         })
-
     edges_out = [{"from": e.from_node_id, "to": e.to_node_id, "relation": e.relation_type} for e in edges]
-
     return {"nodes": nodes_out, "edges": edges_out}
+
 # ─── AUTO-DETECT ARTIFACT TYPE ───────────────────────────────────────────────
-
 @app.post("/repos/{repo_id}/sources/detect-type")
-async def detect_artifact_type(
-    repo_id: str,
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db)
-):
-    import tempfile
+async def detect_artifact_type(repo_id: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
     from ingest import extract_text_from_docx, extract_text_from_pptx
-    import google.generativeai as genai
+    from groq import Groq
 
-    # Save file temporarily
     ext = os.path.splitext(file.filename)[1].lower()
     with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
         shutil.copyfileobj(file.file, tmp)
         tmp_path = tmp.name
 
     try:
-        # Extract first 200 words
         text = ""
         if ext == ".docx":
-            from ingest import extract_text_from_docx
             text = extract_text_from_docx(tmp_path)
         elif ext == ".pptx":
-            from ingest import extract_text_from_pptx
             text = extract_text_from_pptx(tmp_path)
         elif ext == ".pdf":
             text = f"PDF file: {file.filename}"
@@ -580,32 +442,30 @@ async def detect_artifact_type(
             text = f"Image file: {file.filename}"
 
         words = " ".join(text.split()[:200])
-
-        prompt = f"""You are a document classifier. Based on the filename and first 200 words, classify this document into exactly one of these artifact types:
-SOW, Proposal, DesignDocument, ProcessMap, DiscoveryNotes, Other
-
+        prompt = f"""You are a document classifier. Classify this document into exactly one of: SOW, Proposal, DesignDocument, ProcessMap, DiscoveryNotes, Other
 Filename: {file.filename}
 First 200 words: {words}
+Reply with ONLY the artifact type, nothing else."""
 
-Reply with ONLY the artifact type, nothing else. Must be one of: SOW, Proposal, DesignDocument, ProcessMap, DiscoveryNotes, Other"""
-
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model = genai.GenerativeModel("gemini-1.5-flash")
-        response = model.generate_content(prompt)
-        detected = response.text.strip()
-
+        _client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        response = _client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.1,
+        )
+        detected = response.choices[0].message.content.strip()
         valid_types = ["SOW", "Proposal", "DesignDocument", "ProcessMap", "DiscoveryNotes", "Other"]
         if detected not in valid_types:
             detected = "Other"
-
     except Exception as e:
+        print(f"detect-type error: {e}")
         detected = "Other"
     finally:
         os.unlink(tmp_path)
 
     return {"artifact_type": detected, "filename": file.filename}
-# ─── BULK UPLOAD ─────────────────────────────────────────────────────────────
 
+# ─── BULK UPLOAD ─────────────────────────────────────────────────────────────
 @app.post("/repos/{repo_id}/sources/bulk", status_code=201)
 async def bulk_upload_sources(
     repo_id: str,
@@ -614,24 +474,26 @@ async def bulk_upload_sources(
     account_id: Optional[str] = Form(None),
     db: Session = Depends(get_db)
 ):
+    from ingest import extract_text_from_docx, extract_text_from_pptx
+    from groq import Groq
+
     repo = db.query(Repo).filter(Repo.id == repo_id).first()
     if not repo:
         raise HTTPException(status_code=404, detail="Repo not found")
 
     is_internal_bool = is_internal.lower() == "true"
-
     if not is_internal_bool and not account_id:
         raise HTTPException(status_code=422, detail="Account is required when not internal")
 
     ALLOWED_EXTENSIONS = {".docx", ".pdf", ".png", ".pptx", ".jpg", ".jpeg"}
     uploaded = []
+    _client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 
     for file in files:
         ext = os.path.splitext(file.filename)[1].lower()
         if ext not in ALLOWED_EXTENSIONS:
             continue
 
-        # Auto-detect artifact type
         with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             shutil.copyfileobj(file.file, tmp)
             tmp_path = tmp.name
@@ -639,54 +501,126 @@ async def bulk_upload_sources(
         try:
             text = ""
             if ext == ".docx":
-                from ingest import extract_text_from_docx
                 text = extract_text_from_docx(tmp_path)
             elif ext == ".pptx":
-                from ingest import extract_text_from_pptx
                 text = extract_text_from_pptx(tmp_path)
-
             words = " ".join(text.split()[:200])
-
             prompt = f"""Classify this document into exactly one of: SOW, Proposal, DesignDocument, ProcessMap, DiscoveryNotes, Other
 Filename: {file.filename}
 First 200 words: {words}
 Reply with ONLY the artifact type."""
-
-            from google import genai as google_genai
-            _client = google_genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-            response = _client.models.generate_content(model="gemini-1.5-flash", contents=prompt)
-            artifact_type = response.text.strip()
+            response = _client.chat.completions.create(
+                model="llama-3.1-8b-instant",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.1,
+            )
+            artifact_type = response.choices[0].message.content.strip()
             valid_types = ["SOW", "Proposal", "DesignDocument", "ProcessMap", "DiscoveryNotes", "Other"]
             if artifact_type not in valid_types:
                 artifact_type = "Other"
         except:
             artifact_type = "Other"
 
-        # Move tmp to uploads
         file_id = str(uuid.uuid4())
-        stored_filename = f"{file_id}{ext}"
-        stored_path = os.path.join(UPLOAD_DIR, stored_filename)
+        stored_path = os.path.join(UPLOAD_DIR, f"{file_id}{ext}")
         shutil.move(tmp_path, stored_path)
-        file_size = os.path.getsize(stored_path)
 
         source = Source(
-            id=str(uuid.uuid4()),
-            repo_id=repo_id,
+            id=str(uuid.uuid4()), repo_id=repo_id,
             account_id=account_id if not is_internal_bool else None,
-            filename=file.filename,
-            stored_path=stored_path,
-            artifact_type=artifact_type,
-            is_internal=is_internal_bool,
-            size_bytes=file_size,
-            mime_type=file.content_type,
+            filename=file.filename, stored_path=stored_path,
+            artifact_type=artifact_type, is_internal=is_internal_bool,
+            size_bytes=os.path.getsize(stored_path), mime_type=file.content_type,
         )
         db.add(source)
         db.commit()
         db.refresh(source)
-        uploaded.append({
-            "filename": source.filename,
-            "artifact_type": source.artifact_type,
-            "id": source.id
-        })
+        uploaded.append({"filename": source.filename, "artifact_type": source.artifact_type, "id": source.id})
 
     return {"uploaded": uploaded, "count": len(uploaded)}
+
+# ─── NODE CHAT ────────────────────────────────────────────────────────────────
+@app.post("/nodes/{node_id}/chat")
+def chat_with_node(node_id: str, body: ChatMessage, db: Session = Depends(get_db)):
+    from groq import Groq
+    node = db.query(GraphNode).filter(GraphNode.id == node_id, GraphNode.is_deleted == False).first()
+    if not node:
+        raise HTTPException(status_code=404, detail="Node not found")
+
+    source = db.query(Source).filter(Source.id == node.source_id).first() if node.source_id else None
+
+    system_prompt = f"""You are a helpful assistant answering questions about a specific section of a project document.
+
+Section: {node.label}
+Document: {source.filename if source else "Unknown"}
+Content:
+{node.content or "No content available for this section."}
+
+Answer questions based only on the content above. Be concise and helpful."""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in body.history:
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": body.message})
+
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.3,
+        )
+        reply = response.choices[0].message.content.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"reply": reply}
+
+# ─── GLOBAL REPO CHAT ─────────────────────────────────────────────────────────
+@app.post("/repos/{repo_id}/chat")
+def chat_with_repo(repo_id: str, body: ChatMessage, db: Session = Depends(get_db)):
+    from groq import Groq
+    repo = db.query(Repo).filter(Repo.id == repo_id).first()
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repo not found")
+
+    sections = db.query(GraphNode).filter(
+        GraphNode.repo_id == repo_id,
+        GraphNode.node_type == "Section",
+        GraphNode.is_deleted == False,
+        GraphNode.content != None,
+        GraphNode.content != ""
+    ).all()
+
+    context_parts = []
+    for s in sections:
+        source = db.query(Source).filter(Source.id == s.source_id).first() if s.source_id else None
+        context_parts.append(f"[{source.filename if source else 'Unknown'} > {s.label}]\n{s.content}")
+
+    context = "\n\n".join(context_parts[:40])
+
+    system_prompt = f"""You are a helpful assistant with access to all documents in the '{repo.name}' knowledge repository.
+
+Below is the extracted knowledge from all documents:
+
+{context}
+
+Answer questions based on this knowledge. Be concise, specific, and cite which document your answer comes from."""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in body.history:
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": body.message})
+
+    try:
+        client = Groq(api_key=os.getenv("GROQ_API_KEY"))
+        response = client.chat.completions.create(
+            model="llama-3.1-8b-instant",
+            messages=messages,
+            temperature=0.3,
+        )
+        reply = response.choices[0].message.content.strip()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    return {"reply": reply}
